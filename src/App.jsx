@@ -61,8 +61,14 @@ export default function App() {
       setStage(STAGES.JOBS);
       toast.success(`Found ${jobRes.data.total} matching opportunities!`);
     } catch (err) {
-      console.error(err);
-      toast.error(err.response?.data?.error || "Something went wrong. Please try again.");
+      console.error("Upload error:", err);
+      const msg =
+        err.response?.data?.error ||
+        (err.response?.status === 401 ? "Unauthorized — check API protection settings" : null) ||
+        (err.response?.status === 500 ? "Server error — check API logs" : null) ||
+        err.message ||
+        "Something went wrong. Please try again.";
+      toast.error(msg, { autoClose: 6000 });
       setStage(STAGES.UPLOAD);
     }
   }, []);

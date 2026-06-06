@@ -1,7 +1,6 @@
-import { IncomingForm } from "formidable";
+import formidable from "formidable";
 import { readFileSync } from "fs";
 import OpenAI from "openai";
-import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import mammoth from "mammoth";
 import { connectDB } from "../lib/mongodb.js";
 import { Resume } from "../lib/models.js";
@@ -17,19 +16,32 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-async function extractText(filepath, mimetype) {
+async function extractText(filepath, originalFilename, mimetype) {
   const buffer = readFileSync(filepath);
-  if (mimetype === "application/pdf" || filepath.endsWith(".pdf")) {
-    const data = await pdfParse(buffer);
-    return data.text;
+  const name = (originalFilename || "").toLowerCase();
+
+  // PDF — use dynamic import to avoid serverless init errors
+  if (mimetype === "application/pdf" || name.endsWith(".pdf")) {
+    try {
+      const { default: pdfParse } = await import("pdf-parse/lib/pdf-parse.js");
+      const data = await pdfParse(buffer);
+      return data.text;
+    } catch {
+      // Fallback: return raw buffer as string (best effort)
+      return buffer.toString("latin1");
+    }
   }
+
+  // DOCX
   if (
     mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-    filepath.endsWith(".docx")
+    name.endsWith(".docx")
   ) {
     const result = await mammoth.extractRawText({ buffer });
     return result.value;
   }
+
+  // TXT / plain
   return buffer.toString("utf-8");
 }
 
@@ -38,17 +50,26 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // Parse multipart form
-  const form = new IncomingForm({ maxFileSize: 10 * 1024 * 1024, keepExtensions: true });
-  const [fields, files] = await new Promise((resolve, reject) => {
-    form.parse(req, (err, f, fi) => (err ? reject(err) : resolve([f, fi])));
-  });
+  // formidable v3 — promise-based API
+  const form = formidable({ maxFileSize: 10 * 1024 * 1024, keepExtensions: true });
 
-  const file = Array.isArray(files.resume) ? files.resume[0] : files.resume;
-  if (!file) return res.status(400).json({ error: "No file uploaded" });
+  let files;
+  try {
+    [, files] = await form.parse(req);
+  } catch (err) {
+    return res.status(400).json({ error: `File upload failed: ${err.message}` });
+  }
+
+  const fileArr = files.resume;
+  const file = Array.isArray(fileArr) ? fileArr[0] : fileArr;
+  if (!file) return res.status(400).json({ error: "No file uploaded. Make sure the field name is 'resume'." });
 
   try {
-    const resumeText = await extractText(file.filepath, file.mimetype);
+    const resumeText = await extractText(file.filepath, file.originalFilename, file.mimetype);
+
+    if (!resumeText || resumeText.trim().length < 20) {
+      return res.status(400).json({ error: "Could not extract text from the file. Please try a different format." });
+    }
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -56,12 +77,17 @@ export default async function handler(req, res) {
         {
           role: "system",
           content: `You are an expert resume parser. Extract structured information and return a JSON object with these exact keys:
-name, email, phone, location, title, yearsOfExperience (number), skills (string array),
+name (string), email (string), phone (string), location (string), title (string),
+yearsOfExperience (number), skills (string array, min 5),
 experience (array of {company,role,duration,description}),
-education (array of {degree,institution,year}), summary (2-3 sentence summary).
-Return ONLY valid JSON.`,
+education (array of {degree,institution,year}),
+summary (string, 2-3 sentences).
+If a field cannot be found use an empty string or empty array. Return ONLY valid JSON, no markdown.`,
         },
-        { role: "user", content: `Parse this resume:\n\n${resumeText.substring(0, 8000)}` },
+        {
+          role: "user",
+          content: `Parse this resume and extract all information:\n\n${resumeText.substring(0, 8000)}`,
+        },
       ],
       response_format: { type: "json_object" },
     });
@@ -69,14 +95,21 @@ Return ONLY valid JSON.`,
     const parsed = JSON.parse(completion.choices[0].message.content);
     const sessionId = randomUUID();
 
-    await connectDB();
-    const saved = await Resume.create({
-      sessionId,
-      ...parsed,
-      rawTextSnippet: resumeText.substring(0, 500),
-    });
+    // Save to MongoDB (non-blocking — don't fail if DB is down)
+    let resumeId = null;
+    try {
+      await connectDB();
+      const saved = await Resume.create({
+        sessionId,
+        ...parsed,
+        rawTextSnippet: resumeText.substring(0, 500),
+      });
+      resumeId = saved._id;
+    } catch (dbErr) {
+      console.error("MongoDB save failed (non-fatal):", dbErr.message);
+    }
 
-    res.status(200).json({ success: true, sessionId, resumeId: saved._id, data: parsed });
+    res.status(200).json({ success: true, sessionId, resumeId, data: parsed });
   } catch (err) {
     console.error("parse-resume error:", err);
     res.status(500).json({ error: err.message || "Failed to parse resume" });
