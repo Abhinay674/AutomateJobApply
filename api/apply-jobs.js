@@ -1,5 +1,6 @@
 import { connectDB } from "../lib/mongodb.js";
 import { Application } from "../lib/models.js";
+import { sendApplicationConfirmation } from "../lib/mailer.js";
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -15,7 +16,9 @@ export default async function handler(req, res) {
   const { jobs, sessionId, resumeId, applicantName, applicantEmail } = req.body || {};
   if (!jobs?.length) return res.status(400).json({ error: "No jobs provided" });
 
-  // Simulate applying to each job (90% success rate)
+  const appliedAt = new Date().toISOString();
+
+  // Simulate applying to each job (90% success)
   const results = jobs.map((job) => {
     const success = Math.random() > 0.1;
     return {
@@ -38,34 +41,53 @@ export default async function handler(req, res) {
 
   const successful = results.filter((r) => r.status === "applied").length;
   const failed = results.filter((r) => r.status === "failed").length;
+  const summary = { total: jobs.length, successful, failed };
 
-  // Save to MongoDB
-  try {
-    await connectDB();
-    const record = await Application.create({
-      sessionId: sessionId || "anonymous",
-      resumeId: resumeId || null,
-      applicantName: applicantName || "Unknown",
-      applicantEmail: applicantEmail || "",
-      jobs: results,
-      summary: { total: jobs.length, successful, failed },
-    });
+  // Save to MongoDB + send email — both non-blocking
+  let applicationRecordId = null;
+  let emailStatus = null;
 
-    res.status(200).json({
-      success: true,
-      applicationRecordId: record._id,
-      summary: { total: jobs.length, successful, failed },
+  await Promise.allSettled([
+    // Save to DB
+    connectDB()
+      .then(() =>
+        Application.create({
+          sessionId: sessionId || "anonymous",
+          resumeId: resumeId || null,
+          applicantName: applicantName || "Unknown",
+          applicantEmail: applicantEmail || "",
+          jobs: results,
+          summary,
+        })
+      )
+      .then((record) => {
+        applicationRecordId = record._id;
+      })
+      .catch((err) => console.error("DB save failed:", err.message)),
+
+    // Send confirmation email
+    sendApplicationConfirmation({
+      applicantName,
+      applicantEmail,
       results,
-      appliedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("apply-jobs db error:", err);
-    // Still return results even if DB save fails
-    res.status(200).json({
-      success: true,
-      summary: { total: jobs.length, successful, failed },
-      results,
-      appliedAt: new Date().toISOString(),
-    });
-  }
+      summary,
+      appliedAt,
+    })
+      .then((status) => {
+        emailStatus = status;
+      })
+      .catch((err) => {
+        console.error("Email send failed:", err.message);
+        emailStatus = { sent: false, reason: err.message };
+      }),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    applicationRecordId,
+    emailConfirmation: emailStatus,
+    summary,
+    results,
+    appliedAt,
+  });
 }
