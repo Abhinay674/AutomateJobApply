@@ -125,6 +125,12 @@ export default function App() {
 
   const filteredJobs = jobs.filter((j) => {
     if (filter === "all") return true;
+    if (filter === "india") {
+      const loc = (j.location || "").toLowerCase();
+      return loc.includes("india") || loc.includes("hyderabad") || loc.includes("bangalore") ||
+        loc.includes("mumbai") || loc.includes("pune") || loc.includes("chennai") || loc.includes("delhi") ||
+        j.source === "India Jobs";
+    }
     if (filter === "high") return j.matchScore >= 80;
     if (filter === "medium") return j.matchScore >= 60 && j.matchScore < 80;
     if (filter === "remote") return j.location?.toLowerCase().includes("remote");

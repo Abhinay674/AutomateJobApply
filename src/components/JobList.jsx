@@ -2,6 +2,7 @@ import JobCard from "./JobCard";
 
 const FILTERS = [
   { key: "all", label: "All Jobs" },
+  { key: "india", label: "🇮🇳 India Jobs" },
   { key: "high", label: "🔥 Best Match (80%+)" },
   { key: "medium", label: "⚡ Good Match (60%+)" },
   { key: "remote", label: "🌍 Remote" },
